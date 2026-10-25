@@ -546,3 +546,65 @@ async def test_transient_read_timeout_is_retried() -> None:
     programmer = DeviceProgrammer(device)
     assert await programmer.read_memory(0x10, 4) == bytes(range(4))
     assert device.read_failures == 1  # first read raised once and was retried
+
+
+async def test_load_event_waits_for_a_busy_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A device busy with a load step (allocating a segment) leaves the load-control
+    # record unacknowledged for seconds; it is resent with growing pauses instead of
+    # giving up after two 0.2 s resends.
+    from xknx.exceptions import ManagementConnectionError
+
+    from xknxeditor.download import load_state
+    from xknxeditor.download import programmer as module
+
+    pauses: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        pauses.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(module, "_LOAD_EVENT_RETRY_DELAYS", (0.3, 0.7, 1.5, 2.5))
+
+    class BusyDevice(FakeDevice):
+        deaf = 3
+
+        async def send_data(self, payload: object, wait_for_ack: bool = True) -> None:
+            if isinstance(payload, MemoryWrite) and self.deaf:
+                self.deaf -= 1
+                raise ManagementConnectionError("Received no_ack from sending Telegram")
+            await super().send_data(payload, wait_for_ack)  # type: ignore[arg-type]
+
+    device = BusyDevice()
+    await DeviceProgrammer(device).send_memory_load_event(
+        1, 0x0104, None, bytes(10), load_state.LoadState.LOADING
+    )
+    assert pauses == [0.3, 0.7, 1.5]
+    assert device.deaf == 0
+
+
+async def test_plain_memory_write_keeps_the_short_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xknx.exceptions import ManagementConnectionError
+
+    from xknxeditor.download import programmer as module
+    from xknxeditor.download.errors import MemoryWriteNotAcknowledged
+
+    pauses: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        pauses.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+
+    class NoAckDevice(FakeDevice):
+        async def send_data(self, payload: object, wait_for_ack: bool = True) -> None:
+            if isinstance(payload, MemoryWrite):
+                raise ManagementConnectionError("Received no_ack from sending Telegram")
+            await super().send_data(payload, wait_for_ack)  # type: ignore[arg-type]
+
+    with pytest.raises(MemoryWriteNotAcknowledged):
+        await DeviceProgrammer(NoAckDevice()).write_memory(0x4000, bytes(4))
+    assert pauses == [0.2, 0.2]

@@ -136,3 +136,39 @@ async def test_preflight_retries_with_smaller_blocks_within_the_interface(
     assert [a["memory_service_count"] for a in _Runner.attempts] == [None, 15]
     assert all(a["max_apdu_length"] == 55 for a in _Runner.attempts)
     assert _Manager.closed == 2
+
+
+async def test_preflight_waits_before_reconnecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A device that missed the failed attempt's disconnect keeps its transport connection
+    # until its 6 s timeout; the next attempt only connects once that has passed.
+    _Runner.attempts = []
+    _Manager.closed = 0
+    pauses: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        pauses.append(delay)
+
+    async def same_image(*args: object) -> object:
+        return args[3]
+
+    monkeypatch.setattr(download_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(download_module, "_RECONNECT_SETTLE_SECONDS", 6.5)
+    monkeypatch.setattr(download_module, "LoadProcedureRunner", _Runner)
+    monkeypatch.setattr(download_module, "_connection_manager", lambda *a: _Manager())
+    monkeypatch.setattr(download_module, "_device_association_format", same_image)
+    monkeypatch.setattr(download_module, "_resolve_controls", lambda *a: [])
+    monkeypatch.setattr(download_module, "_object_types", lambda *a: {})
+    monkeypatch.setattr(download_module, "_authorize_levels", lambda *a: 0)
+
+    await preflight(
+        cast(Any, None),
+        "1.1.1",
+        cast(Any, None),
+        image=cast(Any, object()),
+        interface_max_apdu_length=55,
+    )
+
+    assert len(_Runner.attempts) == 2
+    assert pauses == [6.5]

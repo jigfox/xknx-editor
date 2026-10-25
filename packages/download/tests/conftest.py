@@ -311,3 +311,15 @@ def _no_sync_interval(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     secure_session._last_sync_response.clear()  # pyright: ignore[reportPrivateUsage]
     yield
     secure_session._last_sync_response.clear()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.fixture(autouse=True)
+def _no_busy_device_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No pauses for a busy device in tests (a test that checks them sets its own)."""
+    import importlib
+
+    from xknxeditor.download import programmer
+
+    download = importlib.import_module("xknxeditor.download.download")
+    monkeypatch.setattr(download, "_RECONNECT_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(programmer, "_LOAD_EVENT_RETRY_DELAYS", (0.0,) * 4)

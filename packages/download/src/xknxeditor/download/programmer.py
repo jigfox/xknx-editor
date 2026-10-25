@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from xknx.exceptions import ManagementConnectionError
@@ -92,6 +92,12 @@ MEMORY_SERVICE_FALLBACKS = (15, 12)
 # writes are idempotent by address, so a resend cannot corrupt the device.
 _TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_DELAY = 0.2
+# Pauses before each resend of an unacknowledged load-control record. A device can stay
+# deaf for seconds while it carries out a load step (allocating a segment erases its
+# EEPROM, e.g. on MDT BE-TA55 push buttons), and the two 0.2 s resends above gave it
+# well under one. The pauses add up to 5 s, short of the 6 s after which a device drops
+# an idle transport connection.
+_LOAD_EVENT_RETRY_DELAYS = (0.3, 0.7, 1.5, 2.5)
 
 _T = TypeVar("_T")
 # Octets consumed by APCI/object/property/count/index in A_PropertyValue_Write.
@@ -586,7 +592,11 @@ class DeviceProgrammer:
             f"{exc} while {operation} [{self.diagnostic_context}]"
         )
 
-    async def _retry_transient(self, send: Callable[[], Awaitable[_T]]) -> _T:
+    async def _retry_transient(
+        self,
+        send: Callable[[], Awaitable[_T]],
+        delays: Sequence[float] | None = None,
+    ) -> _T:
         """Run a management request, retrying a transient timeout a bounded number of
         times before letting it propagate.
 
@@ -594,24 +604,34 @@ class DeviceProgrammer:
         writes are idempotent by address, so a resend cannot corrupt the device. A
         persistent failure (e.g. the device dropped the connection) still propagates
         after the retries, so a genuine no-acknowledge reaches the caller unchanged.
+        ``delays`` gives the pause before each resend (and so their number); by default
+        ``_TRANSIENT_RETRIES`` resends after ``_TRANSIENT_RETRY_DELAY`` each.
         """
-        for attempt in range(_TRANSIENT_RETRIES + 1):
+        pauses = (
+            (_TRANSIENT_RETRY_DELAY,) * _TRANSIENT_RETRIES if delays is None else delays
+        )
+        for attempt in range(len(pauses) + 1):
             try:
                 return await send()
             except ManagementConnectionError:
-                if attempt >= _TRANSIENT_RETRIES:
+                if attempt >= len(pauses):
                     raise
                 logger.debug(
                     "transient management timeout [%s]; retry %d/%d",
                     self.diagnostic_context,
                     attempt + 1,
-                    _TRANSIENT_RETRIES,
+                    len(pauses),
                 )
-                await asyncio.sleep(_TRANSIENT_RETRY_DELAY)
+                await asyncio.sleep(pauses[attempt])
         raise AssertionError("unreachable")
 
-    async def _write_block(self, address: int, block: bytes) -> None:
-        """Write one block via A_Memory_Write or A_UserMemory_Write by address."""
+    async def _write_block(
+        self, address: int, block: bytes, retry_delays: Sequence[float] | None = None
+    ) -> None:
+        """Write one block via A_Memory_Write or A_UserMemory_Write by address.
+
+        ``retry_delays`` overrides the pauses before resending an unacknowledged write
+        (see ``_retry_transient``)."""
         request = (
             UserMemoryWrite(address=address, data=block)
             if address >= _USER_MEMORY_BOUNDARY
@@ -619,7 +639,9 @@ class DeviceProgrammer:
         )
         try:
             if not self.memory_auto_verify:
-                await self._retry_transient(lambda: self.connection.send_data(request))
+                await self._retry_transient(
+                    lambda: self.connection.send_data(request), retry_delays
+                )
                 return
             expected = (
                 UserMemoryResponse
@@ -627,7 +649,7 @@ class DeviceProgrammer:
                 else MemoryResponse
             )
             telegram = await self._retry_transient(
-                lambda: self.connection.request(request, expected)
+                lambda: self.connection.request(request, expected), retry_delays
             )
         except ManagementConnectionError as exc:
             raise MemoryWriteNotAcknowledged(
@@ -1282,7 +1304,7 @@ class DeviceProgrammer:
             record.hex(),
             target,
         )
-        await self._write_block(control_address, record)
+        await self._write_block(control_address, record, _LOAD_EVENT_RETRY_DELAYS)
         if status_address is None:
             return
         state = await self.read_memory_load_state(status_address, object_index)

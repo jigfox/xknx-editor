@@ -8,6 +8,7 @@ the partial download procedure (section 3.5.3).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -114,6 +115,13 @@ class DownloadResult:
 
 _IP_CONFIG_SCOPES = frozenset({DownloadScope.FULL, DownloadScope.APPLICATION})
 _MAC_ADDRESS_LENGTH = 6
+
+
+# Pause before reconnecting for the next memory-service cap. A device that missed the
+# disconnect of the failed attempt (it was still busy) keeps that transport connection
+# until its 6 s connection timeout; a connect before then is answered with the old
+# sequence numbers and fails with an ACK sequence mismatch.
+_RECONNECT_SETTLE_SECONDS = 6.5
 
 
 def _memory_cap_ladder(seed: int | None) -> tuple[int | None, ...]:
@@ -583,6 +591,8 @@ async def download(
     manager: ConnectionManager | None = None
     used_memory_cap: int | None = None
     for attempt, memory_cap in enumerate(memory_caps):
+        if attempt:
+            await asyncio.sleep(_RECONNECT_SETTLE_SECONDS)
         manager = _connection_manager(xknx, address, security)
         runner = LoadProcedureRunner(
             application,
@@ -717,6 +727,8 @@ async def preflight(
     )
     memory_caps = _memory_cap_ladder(None)
     for attempt, memory_cap in enumerate(memory_caps):
+        if attempt:
+            await asyncio.sleep(_RECONNECT_SETTLE_SECONDS)
         manager = _connection_manager(xknx, address, security)
         runner = LoadProcedureRunner(
             application,
