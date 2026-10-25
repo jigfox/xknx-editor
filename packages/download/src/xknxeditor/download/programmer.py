@@ -92,7 +92,8 @@ MEMORY_SERVICE_FALLBACKS = (15, 12)
 # writes are idempotent by address, so a resend cannot corrupt the device.
 _TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_DELAY = 0.2
-# Pauses before each resend of an unacknowledged load-control record. A device can stay
+# Pauses before each resend of an unacknowledged load-control record or an unanswered
+# read of its load state. A device can stay
 # deaf for seconds while it carries out a load step (allocating a segment erases its
 # EEPROM, e.g. on MDT BE-TA55 push buttons), and the two 0.2 s resends above gave it
 # well under one. The pauses add up to 5 s, short of the 6 s after which a device drops
@@ -501,7 +502,9 @@ class DeviceProgrammer:
             offset += len(data)
         return bytes(result)
 
-    async def _read_block(self, address: int, count: int) -> bytes:
+    async def _read_block(
+        self, address: int, count: int, retry_delays: Sequence[float] | None = None
+    ) -> bytes:
         """Read one block via A_Memory_Read or A_UserMemory_Read by address.
 
         Returns the response octets, which may be fewer than ``count`` (a valid
@@ -516,7 +519,7 @@ class DeviceProgrammer:
             expected = MemoryResponse
         try:
             telegram = await self._retry_transient(
-                lambda: self.connection.request(request, expected)
+                lambda: self.connection.request(request, expected), retry_delays
             )
         except ManagementConnectionError as exc:
             # A response longer than a standard frame can be dropped by the interface or a
@@ -1247,10 +1250,20 @@ class DeviceProgrammer:
             )
 
     async def read_memory_load_state(
-        self, address: int, object_index: int
+        self,
+        address: int,
+        object_index: int,
+        retry_delays: Sequence[float] | None = None,
     ) -> load_state.LoadState:
-        """Read a memory-mapped Load State Machine status byte."""
-        data = await self.read_memory(address, 1)
+        """Read a memory-mapped Load State Machine status byte.
+
+        ``retry_delays`` overrides the pauses before repeating an unanswered read (see
+        ``_retry_transient``)."""
+        data = (
+            await self.read_memory(address, 1)
+            if retry_delays is None
+            else await self._read_block(address, 1, retry_delays)
+        )
         if not data:
             raise LoadStateError(
                 f"empty load state at {address:#06x} for object {object_index}"
@@ -1307,7 +1320,11 @@ class DeviceProgrammer:
         await self._write_block(control_address, record, _LOAD_EVENT_RETRY_DELAYS)
         if status_address is None:
             return
-        state = await self.read_memory_load_state(status_address, object_index)
+        # The device can still be busy with the event, so its status reads get the
+        # same patience as the record.
+        state = await self.read_memory_load_state(
+            status_address, object_index, _LOAD_EVENT_RETRY_DELAYS
+        )
         await self._poll_load_state(
             state,
             accepted,
@@ -1315,7 +1332,9 @@ class DeviceProgrammer:
             object_index,
             retries=retries,
             retry_delay=retry_delay,
-            read=lambda: self.read_memory_load_state(status_address, object_index),
+            read=lambda: self.read_memory_load_state(
+                status_address, object_index, _LOAD_EVENT_RETRY_DELAYS
+            ),
             log_prefix="memory load state poll",
         )
 

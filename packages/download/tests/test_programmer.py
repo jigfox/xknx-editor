@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from xknx.telegram import Telegram
 from xknx.telegram.apci import (
     MemoryRead,
     MemoryWrite,
@@ -608,3 +609,38 @@ async def test_plain_memory_write_keeps_the_short_retries(
     with pytest.raises(MemoryWriteNotAcknowledged):
         await DeviceProgrammer(NoAckDevice()).write_memory(0x4000, bytes(4))
     assert pauses == [0.2, 0.2]
+
+
+async def test_load_state_read_waits_for_a_busy_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After allocating a segment the device took the record but cannot answer the
+    # status read yet; that read gets the same growing pauses as the record.
+    from xknx.exceptions import ManagementConnectionError
+
+    from xknxeditor.download import load_state
+    from xknxeditor.download import programmer as module
+
+    pauses: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        pauses.append(delay)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(module, "_LOAD_EVENT_RETRY_DELAYS", (0.3, 0.7, 1.5, 2.5))
+
+    class BusyDevice(FakeDevice):
+        deaf = 2
+
+        async def request(self, payload: object, expected: object) -> Telegram:
+            if isinstance(payload, MemoryRead) and self.deaf:
+                self.deaf -= 1
+                raise ManagementConnectionError("Received no_ack from sending Telegram")
+            return await super().request(payload, expected)  # type: ignore[arg-type]
+
+    device = BusyDevice()
+    await DeviceProgrammer(device).send_memory_load_event(
+        1, 0x0104, 0xB6EA, bytes(10), load_state.LoadState.UNLOADED
+    )
+    assert pauses == [0.3, 0.7]
+    assert device.deaf == 0
